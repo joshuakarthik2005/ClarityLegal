@@ -6,9 +6,9 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.104-009688?logo=fastapi)](https://fastapi.tiangolo.com/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0-3178C6?logo=typescript)](https://www.typescriptlang.org/)
 
-**Democratizing Legal Document Analysis with Google's Vertex AI**
+**Democratizing Document Analysis with Google's Vertex AI**
 
-ClarityLegal is an intelligent legal document analysis platform that leverages Google's AI tools to make sophisticated contract review accessible to everyone - from small businesses to large enterprises. Upload a legal document and get instant AI-powered insights on risks, obligations, and key terms in plain English.
+ClarityLegal is an intelligent document analysis platform that leverages Google's AI tools to make sophisticated contract review accessible to everyone - from small businesses to large enterprises. Upload a legal document and get instant AI-powered insights on risks, obligations, and key terms in plain English.
 
 ---
 
