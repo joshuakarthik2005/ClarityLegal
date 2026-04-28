@@ -1,0 +1,8 @@
+{
+  "version": 2,
+  "buildCommand": "next build",
+  "installCommand": "npm install",
+  "framework": "nextjs",
+  "regions": ["cle1"],
+  "cleanUrls": true
+}
