@@ -1,29 +1,23 @@
-# Legal Document Demystifier Backend Requirements
+﻿# Legal Document Demystifier Backend Requirements
 # Cloud Run compatible versions
 
 # Web framework
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-python-multipart==0.0.6
+fastapi==0.110.1
+uvicorn[standard]>=0.29.0
+python-multipart==0.0.9
 
 # Authentication & Security
 passlib[bcrypt]==1.7.4
-bcrypt==4.0.1  # CRITICAL: Must be 4.0.1 for compatibility with passlib 1.7.4
+bcrypt==4.1.2
 python-jose[cryptography]==3.3.0
-email-validator==2.1.0
+email-validator==2.1.1
 
-# Google Cloud - using latest stable versions
-google-cloud-aiplatform>=1.38.0
-google-cloud-storage==2.10.0
-google-cloud-discoveryengine>=0.11.0
+# AI Provider
+groq>=0.5.0
+python-dotenv==1.0.1
 
 # PDF processing
 PyPDF2==3.0.1
-PyMuPDF==1.24.9
-
-# Machine Learning & NLP
-scikit-learn==1.4.2
-numpy==1.26.4
 
 # HTTP client
 requests==2.31.0

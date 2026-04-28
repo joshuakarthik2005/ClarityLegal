@@ -1,0 +1,26 @@
+[
+  {
+    "stored_name": "43e056b1-c9f0-4562-b704-097ca832bb28.pdf",
+    "original_name": "merged_document.pdf",
+    "url": "http://localhost:8000/files/43e056b1-c9f0-4562-b704-097ca832bb28.pdf",
+    "upload_date": "2026-04-28T07:54:39.548498+00:00",
+    "size": 497625,
+    "user_id": "user_6238af15-2e02-5533-b0ae-565c99a4744e"
+  },
+  {
+    "stored_name": "99800f12-1683-40e6-8fae-a8011f1bcecf.pdf",
+    "original_name": "sample_nda_mock.pdf",
+    "url": "http://localhost:8000/files/99800f12-1683-40e6-8fae-a8011f1bcecf.pdf",
+    "upload_date": "2026-04-28T10:05:23.570905+00:00",
+    "size": 2408,
+    "user_id": "user_6238af15-2e02-5533-b0ae-565c99a4744e"
+  },
+  {
+    "stored_name": "37ca5a28-9037-47b8-ba08-6425bbb9fa0b.pdf",
+    "original_name": "clean.pdf",
+    "url": "http://localhost:8000/files/37ca5a28-9037-47b8-ba08-6425bbb9fa0b.pdf",
+    "upload_date": "2026-04-28T15:00:38.845046+00:00",
+    "size": 313251,
+    "user_id": "user_6238af15-2e02-5533-b0ae-565c99a4744e"
+  }
+]

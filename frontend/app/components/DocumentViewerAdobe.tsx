@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef, useId } from "react";
+import { useState, useEffect, useRef } from "react";
 import ReactDOM from "react-dom";
 import { FileText, MessageSquare, X, Send, Bot, User } from "lucide-react";
 import { API_CONFIG, getApiUrl } from "../config/api";
@@ -9,7 +9,7 @@ import { getAuthToken, withAuthHeaders } from "../utils/auth";
 // Adobe PDF Embed API Configuration
 // Now uses environment variable to support multiple environments/machines
 // Set NEXT_PUBLIC_ADOBE_CLIENT_ID in .env.local
-const ADOBE_API_KEY = process.env.NEXT_PUBLIC_ADOBE_CLIENT_ID || "e3b008974ccc4ac5aacabe3252c01c67";
+const ADOBE_API_KEY = process.env.NEXT_PUBLIC_ADOBE_CLIENT_ID || "f2e8d4ce187f428f99592da250de530b";
 
 // Debug logging for troubleshooting (will show in browser console)
 if (typeof window !== 'undefined') {
@@ -135,14 +135,10 @@ const DocumentViewer = ({ documentUrl, filename, onExplainText, onRagSearch, onV
   const [isTyping, setIsTyping] = useState(false);
   const [documentText, setDocumentText] = useState(""); // Store document text for context
 
-  // Debug: Add a test message to verify UI rendering
-  useEffect(() => {
-    console.log('Current chat messages:', chatMessages);
-    console.log('Chat open:', isChatOpen);
-  }, [chatMessages, isChatOpen]);
-  
-  const reactId = useId();
-  const viewerId = `adobe-dc-view-${reactId}`;
+  // Use a static ID since we only have one viewer on the page at a time.
+  // This avoids any weird DOM querySelector issues with React 18's useId().
+  const viewerId = 'adobe-dc-view-container';
+  const initInProgressRef = useRef(false);
   const sdkReadyRef = useRef(false);
   const selectionIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const lastExplainedRef = useRef<string>("");
@@ -303,6 +299,7 @@ const DocumentViewer = ({ documentUrl, filename, onExplainText, onRagSearch, onV
     // Dispose previous instance
     if (adobeView) {
       try {
+        initInProgressRef.current = false;
         adobeView.dispose?.();
       } catch (e) {
         console.warn("Error disposing Adobe viewer:", e);
@@ -352,42 +349,61 @@ const DocumentViewer = ({ documentUrl, filename, onExplainText, onRagSearch, onV
 
   const initializeAdobePDF = async () => {
     if (!window.AdobeDC || !viewerRef.current) return;
-
+    if (initInProgressRef.current) return;
+    
+    initInProgressRef.current = true;
     try {
-      // Load PDF as ArrayBuffer to avoid CORS/public URL requirements
-      const filePromise = (async () => {
-        // If the URL is cross-origin, route through our proxy to avoid CORS.
-        let fetchUrl = documentUrl;
-        let fetchHeaders: HeadersInit = {};
-        try {
-          const u = new URL(documentUrl, window.location.origin);
-          // Rewrite local relative /api/proxy-gcs path to backend absolute for proxying
-          if (u.pathname.startsWith('/api/proxy-gcs/')) {
-            const rest = u.pathname.replace(/^\/api\/proxy-gcs\//, '');
-            const backendUrl = `${API_CONFIG.BASE_URL}/proxy-gcs/${rest}`;
-            fetchUrl = `/api/proxy-pdf?url=${encodeURIComponent(backendUrl)}`;
-            fetchHeaders = await withAuthHeaders({});
-          } else if (u.pathname.startsWith('/proxy-gcs/')) {
-            // Also handle bare relative /proxy-gcs paths
-            const rest = u.pathname.replace(/^\/proxy-gcs\//, '');
-            const backendUrl = `${API_CONFIG.BASE_URL}/proxy-gcs/${rest}`;
-            fetchUrl = `/api/proxy-pdf?url=${encodeURIComponent(backendUrl)}`;
-            fetchHeaders = await withAuthHeaders({});
-          } else {
-            const isCrossOrigin = u.origin !== window.location.origin;
-            if (isCrossOrigin) {
-              fetchUrl = `/api/proxy-pdf?url=${encodeURIComponent(u.toString())}`;
-              fetchHeaders = await withAuthHeaders({});
-            }
-          }
-        } catch {
-          // If it isn't a valid absolute/relative URL, try as-is
+      // Build the fetch URL — route cross-origin URLs through our proxy
+      let fetchUrl = documentUrl;
+      let fetchHeaders: HeadersInit = {};
+      try {
+        const u = new URL(documentUrl, window.location.origin);
+        // Rewrite local relative /api/proxy-gcs path to backend absolute for proxying
+        if (u.pathname.startsWith('/api/proxy-gcs/')) {
+          const rest = u.pathname.replace(/^\/api\/proxy-gcs\//, '');
+          const backendUrl = `${API_CONFIG.BASE_URL}/proxy-gcs/${rest}`;
+          fetchUrl = `/api/proxy-pdf?url=${encodeURIComponent(backendUrl)}`;
           fetchHeaders = await withAuthHeaders({});
+        } else if (u.pathname.startsWith('/proxy-gcs/')) {
+          const rest = u.pathname.replace(/^\/proxy-gcs\//, '');
+          const backendUrl = `${API_CONFIG.BASE_URL}/proxy-gcs/${rest}`;
+          fetchUrl = `/api/proxy-pdf?url=${encodeURIComponent(backendUrl)}`;
+          fetchHeaders = await withAuthHeaders({});
+        } else {
+          const isCrossOrigin = u.origin !== window.location.origin;
+          if (isCrossOrigin) {
+            fetchUrl = `/api/proxy-pdf?url=${encodeURIComponent(u.toString())}`;
+            fetchHeaders = await withAuthHeaders({});
+          }
         }
-        const res = await fetch(fetchUrl, { headers: fetchHeaders });
-        if (!res.ok) throw new Error(`Failed to fetch PDF: ${res.status}`);
-        return await res.arrayBuffer();
-      })();
+      } catch {
+        // If it isn't a valid absolute/relative URL, try as-is
+        fetchHeaders = await withAuthHeaders({});
+      }
+
+      console.log('📥 Adobe viewer fetching PDF from:', fetchUrl);
+
+      // Adobe SDK requires a Promise that resolves with an ArrayBuffer.
+      // IMPORTANT: We must use the explicit Promise constructor so Adobe
+      // can subscribe to the .then() BEFORE it resolves. An already-resolved
+      // Promise (from an IIFE) may be missed by the SDK.
+      const filePromise = new Promise<ArrayBuffer>((resolve, reject) => {
+        fetch(fetchUrl, { headers: fetchHeaders })
+          .then(res => {
+            if (!res.ok) {
+              reject(new Error(`Failed to fetch PDF: ${res.status}`));
+              return;
+            }
+            return res.arrayBuffer();
+          })
+          .then(buffer => {
+            if (buffer) {
+              console.log('✅ PDF fetched successfully, size:', buffer.byteLength, 'bytes');
+              resolve(buffer);
+            }
+          })
+          .catch(reject);
+      });
 
       // Create new view
       const adobeDCView = new window.AdobeDC.View({
@@ -395,10 +411,12 @@ const DocumentViewer = ({ documentUrl, filename, onExplainText, onRagSearch, onV
         divId: viewerId
       });
 
+      const safeFileName = filename.toLowerCase().endsWith('.pdf') ? filename : `${filename}.pdf`;
+      console.log('📄 Previewing file:', safeFileName, 'with client ID:', ADOBE_API_KEY);
       const previewFilePromise = adobeDCView.previewFile(
         {
           content: { promise: filePromise },
-          metaData: { fileName: filename }
+          metaData: { fileName: safeFileName }
         },
         {
           embedMode: "SIZED_CONTAINER",
@@ -422,7 +440,9 @@ const DocumentViewer = ({ documentUrl, filename, onExplainText, onRagSearch, onV
 
       // Wait for the preview to be ready and get access to viewer APIs
       previewFilePromise.then(adobeViewer => {
+        initInProgressRef.current = false;
         setAdobeViewer(adobeViewer);
+        setIsLoading(false);
         
         // Extract document text for chat context
         extractDocumentText();
@@ -603,7 +623,6 @@ const DocumentViewer = ({ documentUrl, filename, onExplainText, onRagSearch, onV
       );
 
       setAdobeView(adobeDCView);
-      setIsLoading(false);
       
       // Hide unwanted toolbar icons (Settings and User profile)
       setTimeout(() => {
@@ -636,7 +655,6 @@ const DocumentViewer = ({ documentUrl, filename, onExplainText, onRagSearch, onV
       console.error("Adobe PDF initialization error:", err);
       const errorMsg = err instanceof Error ? err.message : "Failed to initialize PDF viewer";
       
-      // Provide helpful error message for common domain authorization issue
       if (errorMsg.includes('not authorized') || errorMsg.includes('domain')) {
         setError(
           `Domain Authorization Error: The current origin (${window.location.origin}) is not authorized for this Adobe Client ID. ` +
@@ -646,6 +664,7 @@ const DocumentViewer = ({ documentUrl, filename, onExplainText, onRagSearch, onV
         setError(errorMsg);
       }
       setIsLoading(false);
+      initInProgressRef.current = false;
     }
   };
 

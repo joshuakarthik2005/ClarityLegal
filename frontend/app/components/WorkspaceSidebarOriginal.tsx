@@ -79,9 +79,18 @@ export default function WorkspaceSidebar({ onDocumentSelect }: WorkspaceSidebarP
 
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
-    if (!file) return;
+    console.log('📤 Upload triggered, file:', file?.name, file?.size, file?.type);
+    
+    // Reset the input so the same file can be re-selected
+    event.target.value = '';
+    
+    if (!file) {
+      console.warn('📤 No file selected');
+      return;
+    }
 
     if (!isAuthenticated) {
+      console.warn('📤 Not authenticated, showing auth modal');
       setShowAuthModal(true);
       return;
     }
@@ -93,6 +102,8 @@ export default function WorkspaceSidebar({ onDocumentSelect }: WorkspaceSidebarP
       formData.append("file", file);
 
       const token = localStorage.getItem("token");
+      console.log('📤 Uploading to:', `${apiUrl}/upload-pdf`, 'with token:', token ? 'present' : 'MISSING');
+      
       const response = await fetch(`${apiUrl}/upload-pdf`, {
         method: "POST",
         headers: {
@@ -101,8 +112,11 @@ export default function WorkspaceSidebar({ onDocumentSelect }: WorkspaceSidebarP
         body: formData
       });
 
+      console.log('📤 Upload response status:', response.status);
+
       if (response.ok) {
         const result = await response.json();
+        console.log('📤 Upload result:', result);
         await loadUserDocuments(); // Reload the documents list
         
         // Auto-select the newly uploaded document (prefer backend's signed_url)
@@ -113,6 +127,7 @@ export default function WorkspaceSidebar({ onDocumentSelect }: WorkspaceSidebarP
           uploadDate: "Just now",
           url: result.signed_url || result.url
         };
+        console.log('📤 New document:', newDoc);
         if (newDoc.url) {
           onDocumentSelect(newDoc);
         }

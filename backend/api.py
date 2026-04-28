@@ -44,27 +44,30 @@ except ImportError as e:
     logger.error(f"Failed to import comparison module: {e}")
     COMPARISON_ENABLED = False
 
-# Import Vertex AI with error handling
+# Import Groq API (replaces Gemini free tier which is blocked in some regions)
 try:
-    import vertexai
-    from vertexai.generative_models import GenerativeModel
-    VERTEX_AI_AVAILABLE = True
-    logger.info("Vertex AI imports successful")
+    from groq import Groq
+    from dotenv import load_dotenv
+    load_dotenv()
+    VERTEX_AI_AVAILABLE = True  # Keep flag name for compatibility
+    logger.info("Groq API imports successful")
 except ImportError as e:
-    logger.warning(f"Direct Vertex AI import failed: {e}")
-    # Try alternative approach
-    try:
-        from google.cloud import aiplatform
-        import vertexai
-        # Set up for alternative model usage
-        VERTEX_AI_AVAILABLE = True
-        GenerativeModel = None
-        logger.info("Using alternative Google Cloud AI Platform import")
-    except ImportError as e2:
-        logger.error(f"All Vertex AI imports failed: {e2}")
-        VERTEX_AI_AVAILABLE = False
-        vertexai = None
-        GenerativeModel = None
+    logger.error(f"Groq API imports failed: {e}")
+    VERTEX_AI_AVAILABLE = False
+    Groq = None
+
+# Import Supabase pgvector RAG module (after dotenv so SUPABASE_DB_URL is available)
+try:
+    import vector_rag
+    PGVECTOR_RAG_AVAILABLE = vector_rag.is_available()
+    if PGVECTOR_RAG_AVAILABLE:
+        logger.info("Supabase pgvector RAG is available")
+    else:
+        logger.warning("Supabase pgvector RAG module loaded but DB not reachable")
+except ImportError as e:
+    logger.warning(f"vector_rag module not available: {e}")
+    vector_rag = None
+    PGVECTOR_RAG_AVAILABLE = False
 
 # Google Cloud Storage imports (will be imported when available)
 try:
@@ -146,55 +149,68 @@ if COMPARISON_ENABLED:
     app.include_router(comparison_router)
     logger.info("Document comparison router included")
 
-# Global variables for Vertex AI configuration
+# Global variables for AI model configuration
 vertex_ai_initialized = False
 model = None
+GROQ_MODEL = "llama-3.3-70b-versatile"
+
+
+class GroqModelWrapper:
+    """Wrapper that mimics Gemini's GenerativeModel interface using Groq API."""
+    def __init__(self, client, model_name):
+        self.client = client
+        self.model_name = model_name
+    
+    def generate_content(self, prompt):
+        """Mimic Gemini's generate_content interface."""
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=4096,
+            temperature=0.3,
+        )
+        return GroqResponse(response.choices[0].message.content)
+
+
+class GroqResponse:
+    """Mimics Gemini response object with .text property."""
+    def __init__(self, text):
+        self.text = text
 
 
 def initialize_vertex_ai():
-    """Initialize Vertex AI with your project settings"""
+    """Initialize Groq API with API key from environment variables."""
     global vertex_ai_initialized, model
     
     if not VERTEX_AI_AVAILABLE:
-        logger.error("Vertex AI modules not available - check dependencies")
+        logger.error("Groq API modules not available - check dependencies")
         return False
     
     try:
-        # For Cloud Run, don't set GOOGLE_APPLICATION_CREDENTIALS
-        # Cloud Run automatically provides service account authentication
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            logger.error("GROQ_API_KEY not found in environment variables")
+            return False
+            
+        logger.info(f"Attempting to initialize Groq API")
+        client = Groq(api_key=api_key)
         
-        # Project settings
-        project_id = "demystifier-ai"
-        location = "us-central1"  # US region for Gemini 2.0 models availability
-        
-        logger.info(f"Attempting to initialize Vertex AI with project: {project_id}, location: {location}")
-        # Initialize Vertex AI
-        vertexai.init(project=project_id, location=location)
-        logger.info("Vertex AI `init` call successful.")
-        
-        # Create the generative model instance if available
-        if GenerativeModel:
-            # Using auto-updated alias (always points to latest stable 2.0 Flash)
-            model_name = "gemini-2.0-flash"
-            logger.info(f"Attempting to load model: {model_name}")
-            model = GenerativeModel(model_name)
-            logger.info(f"Successfully loaded model: {model_name}")
-        else:
-            # Alternative model setup
-            logger.warning("Using alternative model initialization (GenerativeModel not directly available)")
-            model = None  # Will handle in analyze function
+        model_name = GROQ_MODEL
+        logger.info(f"Attempting to load model: {model_name}")
+        model = GroqModelWrapper(client, model_name)
+        logger.info(f"Successfully loaded model: {model_name}")
         
         vertex_ai_initialized = True
-        logger.info(f"Vertex AI initialized successfully.")
+        logger.info(f"Groq API initialized successfully.")
         
         return True
         
     except Exception as e:
         import traceback
-        logger.error(f"CRITICAL: Failed to initialize Vertex AI. Fallback mode will be active.")
+        logger.error(f"CRITICAL: Failed to initialize Groq API. Fallback mode will be active.")
         logger.error(f"Error details: {str(e)}")
         logger.error(f"Traceback: {traceback.format_exc()}")
-        vertex_ai_initialized = False # Ensure it's false on failure
+        vertex_ai_initialized = False
         model = None
         return False
 
@@ -404,63 +420,186 @@ def _derive_doc_name_and_url(doc: Any) -> Tuple[str, str]:
     return (document_name or "Unknown Document", document_url)
 
 
-def _get_fallback_snippets(query: str) -> List[Dict[str, Any]]:
-    """Return sample landlord/tenant snippets when Discovery Engine has no indexed documents.
-
-    Schema: [{"text": str, "source": str, "relevance_score": float, "document_url": str}]
+def _local_text_search(query: str, current_user: Optional[User] = None, document_id: Optional[str] = None, scope: str = "user") -> List[Dict[str, Any]]:
+    """Perform local text-based RAG search across uploaded PDFs.
+    
+    Extracts text from PDFs in temp_uploads/, splits into passages,
+    and scores them against the query using keyword overlap.
+    Returns snippets in the same format as Vertex AI Search.
     """
-    # Normalize query for matching
-    query_lower = query.lower()
+    import re
+    import math
     
-    # Define fallback snippets for landlord/tenant related queries
-    landlord_snippets = [
-        {
-            "text": "John Landlord (sometimes misspelled as John Lanlord) agrees to lease the premises to the tenant for a monthly rent of $2,500, payable on the first day of each month. The lease term shall commence on January 1st and continue for a period of twelve (12) months.",
-            "source": "Employment Agreement - Sample 1.pdf",
-            "relevance_score": 0.95,
-            "document_url": ""
-        },
-        {
-            "text": "The landlord, John Landlord, shall maintain the property in good repair and working order. This includes all plumbing, electrical systems, heating, and air conditioning. The tenant shall be responsible for routine cleaning and minor maintenance.",
-            "source": "Employment Agreement - Sample 2.pdf", 
-            "relevance_score": 0.88,
-            "document_url": ""
-        },
-        {
-            "text": "In the event of any dispute between John Landlord and the tenant, both parties agree to first attempt resolution through mediation before pursuing legal action. The landlord reserves the right to inspect the premises with 24 hours written notice.",
-            "source": "Lease Agreement Template.pdf",
-            "relevance_score": 0.82,
-            "document_url": ""
-        },
-        {
-            "text": "John Landlord requires a security deposit equal to one month's rent ($2,500) to be paid upon signing this agreement. The deposit shall be held in an interest-bearing account and returned within 30 days of lease termination, minus any deductions for damages.",
-            "source": "Rental Terms Document.pdf",
-            "relevance_score": 0.79,
-            "document_url": ""
-        },
-        {
-            "text": "The tenant acknowledges that John Landlord has provided all necessary disclosures regarding the property condition, including lead paint disclosure, mold inspection results, and any known defects or hazards on the premises.",
-            "source": "Property Disclosure Form.pdf",
-            "relevance_score": 0.75,
-            "document_url": ""
+    query_lower = query.lower().strip()
+    if not query_lower or len(query_lower) < 2:
+        return []
+    
+    # Tokenize query into meaningful words (3+ chars)
+    query_words = set(w for w in re.findall(r'\b\w+\b', query_lower) if len(w) >= 3)
+    if not query_words:
+        return []
+    
+    uploads_dir = os.path.join(os.getcwd(), "temp_uploads")
+    if not os.path.isdir(uploads_dir):
+        return []
+    
+    # Read manifest to get file metadata
+    import json as _json
+    manifest_path = os.path.join(uploads_dir, "_manifest.json")
+    manifest = []
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, "r") as mf:
+                manifest = _json.load(mf)
+        except Exception:
+            manifest = []
+    
+    # Build filename -> metadata lookup
+    file_meta = {}
+    for entry in manifest:
+        stored = entry.get("stored_name", "")
+        file_meta[stored] = {
+            "original_name": entry.get("original_name", stored),
+            "url": entry.get("url", ""),
+            "user_id": entry.get("user_id", "")
         }
-    ]
     
-    # Check if query contains landlord-related terms (including common misspellings)
-    landlord_terms = ['john', 'landlord', 'lanlord', 'owner', 'lessor', 'property manager']
-    tenant_terms = ['tenant', 'tennant', 'renter', 'lessee']
-    rental_terms = ['rent', 'lease', 'agreement', 'contract', 'deposit', 'property']
+    # Collect all PDF files
+    pdf_files = [f for f in os.listdir(uploads_dir) if f.endswith('.pdf') and not f.startswith('_')]
     
-    query_matches_landlord = any(term in query_lower for term in landlord_terms)
-    query_matches_tenant = any(term in query_lower for term in tenant_terms)  
-    query_matches_rental = any(term in query_lower for term in rental_terms)
+    # If scope is "document" and document_id is provided, filter to that file
+    if scope == "document" and document_id:
+        pdf_files = [f for f in pdf_files if document_id in f]
     
-    # Return relevant snippets if query matches landlord/tenant/rental context
-    if query_matches_landlord or query_matches_tenant or query_matches_rental:
-        logger.info(f"Fallback mode: Returning {len(landlord_snippets)} sample snippets for query: {query}")
-        return landlord_snippets
+    # If user filtering is desired
+    if current_user and scope == "user":
+        user_files = [entry.get("stored_name", "") for entry in manifest 
+                      if entry.get("user_id") in (None, "", str(current_user.id))]
+        if user_files:
+            pdf_files = [f for f in pdf_files if f in user_files]
     
-    # No relevant fallback snippets available
+    all_passages = []
+    
+    for pdf_file in pdf_files:
+        pdf_path = os.path.join(uploads_dir, pdf_file)
+        meta = file_meta.get(pdf_file, {"original_name": pdf_file, "url": "", "user_id": ""})
+        
+        try:
+            # Extract text from PDF
+            import PyPDF2
+            with open(pdf_path, 'rb') as f:
+                reader = PyPDF2.PdfReader(f)
+                full_text = ""
+                for page in reader.pages:
+                    page_text = page.extract_text() or ""
+                    full_text += page_text + "\n"
+            
+            if not full_text.strip():
+                continue
+            
+            # Split into passages (by paragraph or every ~300 chars at sentence boundaries)
+            paragraphs = [p.strip() for p in re.split(r'\n\s*\n|\n(?=[A-Z])', full_text) if p.strip()]
+            
+            # Further split very long paragraphs
+            passages = []
+            for para in paragraphs:
+                if len(para) > 500:
+                    # Split at sentence boundaries
+                    sentences = re.split(r'(?<=[.!?])\s+', para)
+                    chunk = ""
+                    for sent in sentences:
+                        if len(chunk) + len(sent) > 400 and chunk:
+                            passages.append(chunk.strip())
+                            chunk = sent
+                        else:
+                            chunk += " " + sent if chunk else sent
+                    if chunk.strip():
+                        passages.append(chunk.strip())
+                elif len(para) > 30:  # Skip very short passages
+                    passages.append(para)
+            
+            # Score each passage against the query
+            for passage in passages:
+                passage_lower = passage.lower()
+                passage_words = set(re.findall(r'\b\w+\b', passage_lower))
+                
+                # Calculate relevance score
+                matching_words = query_words & passage_words
+                if not matching_words:
+                    continue
+                
+                # TF-IDF-like scoring
+                # - More matching words = higher score
+                # - Exact phrase match bonus
+                # - Proximity bonus (words appearing close together)
+                word_overlap = len(matching_words) / len(query_words)
+                
+                # Exact substring match bonus
+                exact_bonus = 0.3 if query_lower in passage_lower else 0
+                
+                # Check for phrase proximity (query words within 50 chars of each other)
+                proximity_bonus = 0
+                if len(matching_words) >= 2:
+                    positions = []
+                    for word in matching_words:
+                        pos = passage_lower.find(word)
+                        if pos >= 0:
+                            positions.append(pos)
+                    if positions:
+                        spread = max(positions) - min(positions)
+                        if spread < 100:
+                            proximity_bonus = 0.2
+                
+                score = min(word_overlap + exact_bonus + proximity_bonus, 1.0)
+                
+                if score >= 0.15:  # Minimum relevance threshold
+                    all_passages.append({
+                        "text": passage[:500],  # Cap at 500 chars
+                        "source": meta["original_name"],
+                        "relevance_score": round(score, 3),
+                        "document_url": meta.get("url", "")
+                    })
+                    
+        except Exception as e:
+            logger.warning(f"Error extracting text from {pdf_file}: {e}")
+            continue
+    
+    # Sort by relevance score, return top 10
+    all_passages.sort(key=lambda x: x["relevance_score"], reverse=True)
+    return all_passages[:10]
+
+
+def _get_fallback_snippets(query: str, current_user: Optional[User] = None, document_id: Optional[str] = None, scope: str = "user") -> List[Dict[str, Any]]:
+    """Search for relevant snippets using Supabase pgvector, then local files.
+    
+    Priority:
+      1. Supabase pgvector full-text search (persistent, production-ready)
+      2. Local PDF text search (dev fallback)
+    """
+    # 1. Try Supabase pgvector search first
+    if PGVECTOR_RAG_AVAILABLE and vector_rag is not None:
+        try:
+            user_id = str(current_user.id) if current_user and hasattr(current_user, 'id') else None
+            results = vector_rag.search_snippets(
+                query=query,
+                user_id=user_id,
+                document_name=document_id,
+                scope=scope,
+                limit=10
+            )
+            if results:
+                logger.info(f"Supabase RAG: Found {len(results)} snippets for query: {query}")
+                return results
+        except Exception as e:
+            logger.warning(f"Supabase RAG search failed, falling back to local: {e}")
+    
+    # 2. Fall back to local PDF text search
+    local_results = _local_text_search(query, current_user=current_user, document_id=document_id, scope=scope)
+    if local_results:
+        logger.info(f"Local RAG: Found {len(local_results)} snippets for query: {query}")
+        return local_results
+    
+    # No results found
     return []
 
 
@@ -500,23 +639,23 @@ def search_related_documents(
     sanitized_query = _sanitize_rag_query(query or "")
 
     if not DISCOVERY_ENGINE_AVAILABLE:
-        logger.warning("Discovery Engine unavailable;")
-        if enable_fallback:
-            fallback_snippets = _get_fallback_snippets(sanitized_query)
-            if fallback_snippets:
-                return {
-                    "success": True,
-                    "related_snippets": fallback_snippets,
-                    "total_results": len(fallback_snippets),
-                    "search_query": sanitized_query,
-                    "note": "Using sample snippets (fallback mode)"
-                }
+        logger.warning("Discovery Engine unavailable; using local text search")
+        # Use local PDF text search instead of Vertex AI
+        local_snippets = _get_fallback_snippets(sanitized_query, current_user=current_user, document_id=document_id, scope=scope)
+        if local_snippets:
+            return {
+                "success": True,
+                "related_snippets": local_snippets,
+                "total_results": len(local_snippets),
+                "search_query": sanitized_query,
+                "note": "Using local document search"
+            }
         return {
             "success": True,
             "related_snippets": [],
             "total_results": 0,
             "search_query": sanitized_query,
-            "note": "Vertex AI Search unavailable" if allow_mock else ""
+            "note": "No matching snippets found in uploaded documents"
         }
 
     try:
@@ -930,7 +1069,7 @@ def search_related_documents(
 
         # If Discovery Engine returned no results, optionally provide fallback samples
         if len(related_snippets) == 0 and enable_fallback:
-            fallback_snippets = _get_fallback_snippets(sanitized_query)
+            fallback_snippets = _get_fallback_snippets(sanitized_query, current_user=current_user, document_id=document_id, scope=scope)
             if fallback_snippets:
                 return {
                     "success": True,
@@ -961,7 +1100,7 @@ def search_related_documents(
         # TEMPORARY DEBUG: Force fallback for "user" scope when no filter is applied
         if len(related_snippets) == 0 and scope == "user" and not metadata_filter:
             logger.warning(f"DEBUG: No results for scope=user, no filter. Forcing fallback for query: {sanitized_query}")
-            fallback_snippets = _get_fallback_snippets(sanitized_query)
+            fallback_snippets = _get_fallback_snippets(sanitized_query, current_user=current_user, document_id=document_id, scope=scope)
             if fallback_snippets:
                 return {
                     "success": True,
@@ -1043,7 +1182,7 @@ def search_related_documents(
         logger.error(f"Discovery Engine search failed: {e}")
         if enable_fallback:
             try:
-                fallback_snippets = _get_fallback_snippets(sanitized_query)
+                fallback_snippets = _get_fallback_snippets(sanitized_query, current_user=current_user, document_id=document_id, scope=scope)
                 if fallback_snippets:
                     return {
                         "success": True,
@@ -1273,7 +1412,7 @@ async def chat_endpoint(request: ChatRequest, current_user: User = Depends(requi
                     text = "I couldn't generate a response right now. Please try again."
                 return {
                     "response": text,
-                    "model_used": "gemini-2.0-flash",
+                    "model_used": GROQ_MODEL,
                     "grounded": bool(document_text),
                 }
             except Exception as gen_err:
@@ -1329,13 +1468,27 @@ async def analyze_document_endpoint(file: UploadFile = File(...), current_user: 
         
         # For now, assume it's text content
         # In a production app, you'd want proper file parsing for PDF, DOC, etc.
-        try:
-            legal_text = content.decode('utf-8')
-        except UnicodeDecodeError:
-            raise HTTPException(
-                status_code=400, 
-                detail="Unable to decode file content. Please ensure the file is in text format."
-            )
+        is_pdf = file.content_type == "application/pdf" or (file.filename and file.filename.lower().endswith('.pdf'))
+        
+        if is_pdf:
+            try:
+                import PyPDF2
+                import io
+                pdf_reader = PyPDF2.PdfReader(io.BytesIO(content))
+                legal_text = ""
+                for page in pdf_reader.pages:
+                    legal_text += page.extract_text() + "\n"
+            except Exception as e:
+                logger.error(f"PDF extraction error: {e}")
+                raise HTTPException(status_code=400, detail="Failed to extract text from PDF.")
+        else:
+            try:
+                legal_text = content.decode('utf-8')
+            except UnicodeDecodeError:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Unable to decode file content. Please ensure the file is in text format."
+                )
         
         # Validate content length
         if len(legal_text.strip()) == 0:
@@ -1407,8 +1560,22 @@ async def analyze_text_endpoint(request: Dict[str, str], current_user: User = De
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 
+from fastapi import Request
+from fastapi.responses import FileResponse
+
+# Ensure local upload directory exists
+import os
+os.makedirs("temp_uploads", exist_ok=True)
+
+@app.get("/files/{filename}")
+async def get_local_file(filename: str):
+    file_path = os.path.join("temp_uploads", filename)
+    if os.path.exists(file_path):
+        return FileResponse(file_path, media_type="application/pdf")
+    raise HTTPException(status_code=404, detail="File not found")
+
 @app.post("/upload-pdf")
-async def upload_pdf(file: UploadFile = File(...), current_user: Optional[User] = Depends(optional_auth)):
+async def upload_pdf(request: Request, file: UploadFile = File(...), current_user: Optional[User] = Depends(optional_auth)):
     """
     Upload a PDF document to Google Cloud Storage and return a signed URL
     Requires authentication for file storage, but allows unauthenticated demo usage
@@ -1432,15 +1599,70 @@ async def upload_pdf(file: UploadFile = File(...), current_user: Optional[User] 
             )
         
         if not GCS_AVAILABLE:
-            # Fallback: return a mock URL for development
-            mock_url = f"https://storage.googleapis.com/mock-bucket/{uuid.uuid4()}.pdf"
-            logger.warning("Using mock URL - Google Cloud Storage not available")
+            # Fallback: save locally and return local URL
+            import json as _json
+            from datetime import datetime, timezone
+            
+            file_extension = os.path.splitext(file.filename)[1] if file.filename else '.pdf'
+            unique_id = str(uuid.uuid4())
+            local_filename = f"{unique_id}{file_extension}"
+            local_path = os.path.join("temp_uploads", local_filename)
+            
+            with open(local_path, "wb") as f:
+                f.write(content)
+                
+            local_url = str(request.base_url) + f"files/{local_filename}"
+            logger.info(f"Saved file locally at {local_path}, URL: {local_url}")
+            
+            # Write to local manifest so /user-files can list it
+            manifest_path = os.path.join("temp_uploads", "_manifest.json")
+            manifest = []
+            if os.path.exists(manifest_path):
+                try:
+                    with open(manifest_path, "r") as mf:
+                        manifest = _json.load(mf)
+                except Exception:
+                    manifest = []
+            
+            manifest.append({
+                "stored_name": local_filename,
+                "original_name": file.filename,
+                "url": local_url,
+                "upload_date": datetime.now(timezone.utc).isoformat(),
+                "size": len(content),
+                "user_id": str(current_user.id) if current_user else ""
+            })
+            
+            with open(manifest_path, "w") as mf:
+                _json.dump(manifest, mf, indent=2)
+            
+            # Index PDF text into Supabase pgvector for RAG search
+            if PGVECTOR_RAG_AVAILABLE and vector_rag is not None:
+                try:
+                    import PyPDF2
+                    import io
+                    reader = PyPDF2.PdfReader(io.BytesIO(content))
+                    full_text = ""
+                    for page in reader.pages:
+                        full_text += (page.extract_text() or "") + "\n"
+                    if full_text.strip():
+                        user_id = str(current_user.id) if current_user else "anonymous"
+                        rag_result = vector_rag.store_document_chunks(
+                            user_id=user_id,
+                            document_name=file.filename or local_filename,
+                            full_text=full_text,
+                            document_url=local_url
+                        )
+                        logger.info(f"RAG indexing: {rag_result}")
+                except Exception as rag_err:
+                    logger.warning(f"RAG indexing failed (non-fatal): {rag_err}")
+            
             return JSONResponse(
                 status_code=200,
                 content={
-                    "signed_url": mock_url,
+                    "signed_url": local_url,
                     "filename": file.filename,
-                    "message": "Mock upload successful (GCS not configured)"
+                    "message": "Local upload successful (GCS not configured)"
                 }
             )
         
@@ -1611,7 +1833,7 @@ def summarize_legal_document(legal_text: str) -> Dict[str, Any]:
         return {
             "success": True,
             "summary": response.text,
-            "model_used": "gemini-2.0-flash"
+            "model_used": GROQ_MODEL
         }
         
     except Exception as e:
@@ -1680,8 +1902,8 @@ async def summarize_document_endpoint(file: UploadFile = File(...), current_user
         # Read file content
         content = await file.read()
         
-        # Handle different file types
-        if file.content_type == "application/pdf":
+        is_pdf = file.content_type == "application/pdf" or (file.filename and file.filename.lower().endswith('.pdf'))
+        if is_pdf:
             try:
                 # Import PyPDF2 for PDF processing
                 import PyPDF2
@@ -2310,6 +2532,22 @@ async def extract_pdf_text(request: ExtractRequest, current_user: User = Depends
             except Exception as ge:
                 logger.error(f"GCS fetch in extract_pdf_text failed: {ge}")
                 raise HTTPException(status_code=500, detail=f"GCS access failed: {str(ge)}")
+        elif path.startswith("/files/"):
+            # It's a local file URL that we generated
+            try:
+                parts = path.split("/files/", 1)
+                filename = parts[1]
+                local_path = os.path.join("temp_uploads", filename)
+                if not os.path.exists(local_path):
+                    raise HTTPException(status_code=404, detail="File not found locally")
+                with open(local_path, "rb") as f:
+                    pdf_bytes = f.read()
+                ctype = "application/pdf"
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Local file fetch failed: {e}")
+                raise HTTPException(status_code=500, detail="Failed to read local file")
         else:
             # Fallback to HTTP(S) fetch
             resp = requests.get(url, timeout=20)
@@ -2362,30 +2600,34 @@ async def get_user_files(current_user: User = Depends(require_auth)):
     """
     try:
         if not GCS_AVAILABLE:
-            # Return mock data for development
-            mock_files = [
-                {
-                    "id": "mock-file-1",
-                    "name": "Employment_Agreement.pdf",
-                    "url": "https://storage.googleapis.com/mock-bucket/mock-file-1.pdf",
-                    "upload_date": "2024-01-15T10:30:00Z",
-                    "size": 245760
-                },
-                {
-                    "id": "mock-file-2", 
-                    "name": "Service_Contract.pdf",
-                    "url": "https://storage.googleapis.com/mock-bucket/mock-file-2.pdf",
-                    "upload_date": "2024-01-14T15:45:00Z",
-                    "size": 189440
-                }
-            ]
+            # Read from local manifest to return actual uploaded files
+            import json as _json
+            manifest_path = os.path.join("temp_uploads", "_manifest.json")
+            local_files = []
+            if os.path.exists(manifest_path):
+                try:
+                    with open(manifest_path, "r") as mf:
+                        manifest = _json.load(mf)
+                    # Filter files belonging to this user (or show all for dev convenience)
+                    for entry in manifest:
+                        user_id_match = entry.get("user_id") in (None, "", str(current_user.id))
+                        if user_id_match:
+                            local_files.append({
+                                "id": entry.get("stored_name", entry.get("id", "")),
+                                "name": entry.get("original_name", "unknown.pdf"),
+                                "url": entry.get("url", ""),
+                                "upload_date": entry.get("upload_date", ""),
+                                "size": entry.get("size", 0)
+                            })
+                except Exception as e:
+                    logger.error(f"Error reading local manifest: {e}")
             
             return JSONResponse(
                 status_code=200,
                 content={
-                    "files": mock_files,
-                    "total": len(mock_files),
-                    "message": "Mock data - GCS not configured"
+                    "files": local_files,
+                    "total": len(local_files),
+                    "message": "Local files (GCS not configured)"
                 }
             )
 

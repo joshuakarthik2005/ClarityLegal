@@ -6,10 +6,20 @@ import { ZoomIn, ZoomOut, RotateCw, Download, FileText, Loader2 } from "lucide-r
 interface DocumentViewerProps {
   documentUrl: string;
   filename: string;
-  onTextSelection: (selectedText: string) => void;
+  onTextSelection?: (selectedText: string) => void;
+  onExplainText?: (text: string) => void;
+  onRagSearch?: (query: string) => void;
+  onViewerReady?: (searchFunction: (text: string) => void) => void;
 }
 
-export default function DocumentViewer({ documentUrl, filename, onTextSelection }: DocumentViewerProps) {
+export default function DocumentViewer({ 
+  documentUrl, 
+  filename, 
+  onTextSelection,
+  onExplainText,
+  onRagSearch,
+  onViewerReady
+}: DocumentViewerProps) {
   const [zoom, setZoom] = useState(100);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -38,7 +48,9 @@ export default function DocumentViewer({ documentUrl, filename, onTextSelection 
       if (selection && selection.toString().trim()) {
         const text = selection.toString().trim();
         setSelectedText(text);
-        onTextSelection(text);
+        if (onTextSelection) onTextSelection(text);
+        if (onExplainText) onExplainText(text);
+        if (onRagSearch) onRagSearch(text);
       }
     } catch (error) {
       console.warn("Text selection not available:", error);

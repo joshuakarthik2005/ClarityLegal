@@ -15,31 +15,33 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from sklearn.metrics.pairwise import cosine_similarity
 from google.cloud import aiplatform
-from vertexai.language_models import TextEmbeddingModel, TextGenerationModel
-from vertexai.generative_models import GenerativeModel
+import os
+from groq import Groq
 
 from auth import get_current_user
 
 # Initialize router
 router = APIRouter(prefix="/api/compare", tags=["Document Comparison"])
 
-# Initialize AI models (these will be lazy-loaded)
-_embedding_model: Optional[TextEmbeddingModel] = None
-_generative_model: Optional[GenerativeModel] = None
+# Initialize AI models
+_embedding_model = None
+_groq_client = None
 
-def get_embedding_model() -> TextEmbeddingModel:
-    """Get or initialize the text embedding model."""
-    global _embedding_model
-    if _embedding_model is None:
-        _embedding_model = TextEmbeddingModel.from_pretrained("textembedding-gecko@003")
-    return _embedding_model
+def get_groq_client():
+    """Get or initialize the Groq client."""
+    global _groq_client
+    if _groq_client is None:
+        api_key = os.getenv("GROQ_API_KEY")
+        if api_key:
+            _groq_client = Groq(api_key=api_key)
+    return _groq_client
 
-def get_generative_model() -> GenerativeModel:
-    """Get or initialize the generative model."""
-    global _generative_model
-    if _generative_model is None:
-        _generative_model = GenerativeModel("gemini-1.5-pro")
-    return _generative_model
+def get_generative_model():
+    """Get Groq client for text generation (replaces Vertex AI GenerativeModel)."""
+    client = get_groq_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="AI model not configured")
+    return client
 
 def extract_text_from_pdf(file: UploadFile) -> str:
     """
@@ -229,31 +231,32 @@ async def analyze_semantic_diff(original_text: str, revised_text: str) -> Dict[s
 \"\"\""""
 
     try:
-        model = get_generative_model()
-        response = model.generate_content(prompt)
+        client = get_generative_model()
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=2048,
+            temperature=0.3,
+        )
+        response_text = response.choices[0].message.content.strip()
         
-        # Try to parse the JSON response
+        # Find JSON-like content within the response
         try:
-            # Extract JSON from the response text
-            response_text = response.text.strip()
-            # Find JSON-like content within the response
             if '{' in response_text and '}' in response_text:
                 start_idx = response_text.find('{')
                 end_idx = response_text.rfind('}') + 1
                 json_text = response_text[start_idx:end_idx]
                 return json.loads(json_text)
             else:
-                # Fallback if no JSON structure found
                 return {
                     "summary": "Changes detected between clauses",
                     "implication": response_text,
                     "classification": "Neutral"
                 }
         except json.JSONDecodeError:
-            # Fallback if JSON parsing fails
             return {
                 "summary": "Changes detected between clauses",
-                "implication": response.text,
+                "implication": response_text,
                 "classification": "Neutral"
             }
     

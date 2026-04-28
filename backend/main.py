@@ -15,10 +15,9 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import re
-from google.cloud import aiplatform
-from google.cloud import discoveryengine
-from google.oauth2 import service_account
-import google.auth
+from groq import Groq
+from dotenv import load_dotenv
+load_dotenv()
 
 # Import authentication module
 import auth
@@ -60,39 +59,50 @@ class RAGSearchResponse(BaseModel):
     search_query: str
     total_results: int
 
-# Global variables for Vertex AI configuration
+# Global variables for AI model configuration
 vertex_ai_initialized = False
 model = None
+GROQ_MODEL = "llama-3.3-70b-versatile"
+
+
+class GroqModelWrapper:
+    """Wrapper that mimics Gemini's GenerativeModel interface using Groq API."""
+    def __init__(self, client, model_name):
+        self.client = client
+        self.model_name = model_name
+    
+    def generate_content(self, prompt):
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=4096,
+            temperature=0.3,
+        )
+        return type('Response', (), {'text': response.choices[0].message.content})()
 
 
 def initialize_vertex_ai():
-    """Initialize Vertex AI with your project settings"""
+    """Initialize Groq API"""
     global vertex_ai_initialized, model
     
     try:
-        # For Cloud Run, use service account attached to the instance
-        # Project settings
-        project_id = "demystifier-ai"
-        location = "asia-south1"  # Mumbai region works for India users!
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            logger.error("GROQ_API_KEY not found in environment variables")
+            return False
+            
+        client = Groq(api_key=api_key)
+        model = GroqModelWrapper(client, GROQ_MODEL)
         
-        # Initialize Vertex AI
-        aiplatform.init(project=project_id, location=location)
-        
-        # Use the newer approach with Vertex AI models
-        from google.cloud.aiplatform.gapic.schema import predict
-        
-        # Create an endpoint for text generation
-        # For now, let's use a simpler approach - just mark as initialized
-        # and handle the actual generation in the analysis function
         vertex_ai_initialized = True
-        logger.info(f"Vertex AI initialized with project: {project_id}, location: {location}")
+        logger.info(f"Groq API initialized successfully with model: {GROQ_MODEL}")
         
         return True
         
     except Exception as e:
-        logger.error(f"Failed to initialize Vertex AI: {str(e)}")
-        # For now, let's continue without AI to test the basic API
+        logger.error(f"Failed to initialize Groq API: {str(e)}")
         vertex_ai_initialized = False
+        model = None
         return False
 
 
@@ -120,7 +130,7 @@ app = FastAPI(
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with your frontend URL
+    allow_origins=["*"] # In production, replace with your frontend URL`n    #allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "https://legal-frontend-uawpzg4rzq-el.a.run.app", "https://legal-frontend-144935064473.asia-south1.run.app"],  # In production, replace with your frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1236,3 +1246,4 @@ if __name__ == "__main__":
         port=port,
         log_level="info"
     )
+
